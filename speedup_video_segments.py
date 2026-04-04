@@ -7,8 +7,10 @@ Input/output paths and segments default to ``INPUT_VIDEO``, ``OUTPUT_VIDEO``,
 and ``SEGMENTS`` in ``config.py``.
 
 Each segment dict uses:
-  start_time   — seconds (float)
-  end_time     — seconds (float), or omit / use None for end of file
+  end_time — seconds (float) where this segment ends on the source timeline; use
+    ``null`` / ``None`` for the last segment to mean “through end of file”.
+    Segments are ordered; the first starts at 0, each later one starts where the
+    previous ended.
   speedup_factor — playback speed multiplier (e.g. 1.25, 4.0, 5.0)
 
 Video: after trim, setpts=PTS/speedup_factor (same idea as your example).
@@ -70,11 +72,11 @@ def atempo_chain(factor: float) -> list[float]:
 def normalize_segments(
     raw: list[dict[str, Any]], duration: float
 ) -> list[tuple[float, float, float]]:
-    """Return list of (start, end, speed) with ends clamped and None ends resolved."""
+    """Return list of (start, end, speed). Starts at 0; each segment ends at end_time."""
     out: list[tuple[float, float, float]] = []
+    cursor = 0.0
     for i, seg in enumerate(raw):
         try:
-            start = float(seg["start_time"])
             speed = float(seg["speedup_factor"])
         except KeyError as e:
             raise KeyError(f"segment {i}: missing required key {e}") from e
@@ -83,11 +85,17 @@ def normalize_segments(
             end = duration
         else:
             end = float(end_val)
-        start = max(0.0, min(start, duration))
+            if end < cursor - 1e-9:
+                raise ValueError(
+                    f"segment {i}: end_time {end} is before current position "
+                    f"{cursor:.6g}; end times must be non-decreasing."
+                )
+        start = max(0.0, min(cursor, duration))
         end = max(start, min(end, duration))
         if end <= start:
             continue
         out.append((start, end, speed))
+        cursor = end
     return out
 
 
