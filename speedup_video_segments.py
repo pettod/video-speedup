@@ -4,7 +4,7 @@ Build an ffmpeg -filter_complex graph from a list of segment dicts and print
 the full ffmpeg command (or optionally run it).
 
 Input/output paths and segments default to ``INPUT_VIDEO``, ``OUTPUT_VIDEO``,
-and ``SEGMENTS`` in ``config.py``.
+``SEGMENTS``, and ``AUDIO_VOLUME`` (final mix gain) in ``config.py``.
 
 Each segment dict uses:
   end_time — seconds (float) where this segment ends on the source timeline; use
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from config import INPUT_VIDEO, OUTPUT_VIDEO, SEGMENTS
+from config import AUDIO_VOLUME, INPUT_VIDEO, OUTPUT_VIDEO, SEGMENTS
 
 
 def ffprobe_duration_seconds(path: Path) -> float:
@@ -102,9 +102,12 @@ def normalize_segments(
 
 
 def build_filter_complex(
-    segments: list[tuple[float, float, float, bool]], n: int
-) -> str:
-    """Build the filter_complex string for n segments (after dropping empty ranges)."""
+    segments: list[tuple[float, float, float, bool]],
+    n: int,
+    *,
+    audio_volume: float = 1.0,
+) -> tuple[str, str]:
+    """Build filter_complex and the final audio pad label to map (after concat, optional volume)."""
     if n < 1:
         raise ValueError("Need at least one non-empty segment.")
 
@@ -146,7 +149,12 @@ def build_filter_complex(
         f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
     )
 
-    return ";".join(parts)
+    audio_label = "outa"
+    if abs(float(audio_volume) - 1.0) > 1e-9:
+        parts.append(f"[outa]volume={float(audio_volume):g}[outa_vol]")
+        audio_label = "outa_vol"
+
+    return ";".join(parts), audio_label
 
 
 def build_ffmpeg_command(
@@ -154,10 +162,11 @@ def build_ffmpeg_command(
     output_path: Path,
     segments: list[tuple[float, float, float, bool]],
     *,
+    audio_volume: float = 1.0,
     extra_ffmpeg_args: list[str] | None = None,
 ) -> str:
     n = len(segments)
-    fc = build_filter_complex(segments, n)
+    fc, a_label = build_filter_complex(segments, n, audio_volume=audio_volume)
     extra = extra_ffmpeg_args or []
     cmd_parts = [
         "ffmpeg",
@@ -169,7 +178,7 @@ def build_ffmpeg_command(
         "-map",
         "[outv]",
         "-map",
-        "[outa]",
+        f"[{a_label}]",
         *extra,
         str(output_path),
     ]
@@ -254,13 +263,15 @@ def main() -> int:
         print("Error: no valid segments after normalization.", file=sys.stderr)
         return 1
 
-    cmd_str = build_ffmpeg_command(args.input, args.output, segs)
+    cmd_str = build_ffmpeg_command(
+        args.input, args.output, segs, audio_volume=AUDIO_VOLUME
+    )
     print(cmd_str)
 
     if args.run:
         # Rebuild argv without shell — execute directly
         n = len(segs)
-        fc = build_filter_complex(segs, n)
+        fc, a_label = build_filter_complex(segs, n, audio_volume=AUDIO_VOLUME)
         argv = [
             "ffmpeg",
             "-y",
@@ -271,7 +282,7 @@ def main() -> int:
             "-map",
             "[outv]",
             "-map",
-            "[outa]",
+            f"[{a_label}]",
             str(args.output),
         ]
         print("--- running ---", file=sys.stderr)

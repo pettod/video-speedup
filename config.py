@@ -3,6 +3,8 @@ from typing import Any
 
 INPUT_VIDEO = "input.mp4"
 OUTPUT_VIDEO = f"speedup_{INPUT_VIDEO}"
+
+AUDIO_VOLUME = 1.0
 SEGMENTS: list[dict[str, Any]] = [
     {"end_time": 0.6, "speedup_factor": 1.00, "mute": True},
     {"end_time": 10.5, "speedup_factor": 1.00, "mute": False},
