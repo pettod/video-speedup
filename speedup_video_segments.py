@@ -12,6 +12,7 @@ Each segment dict uses:
     Segments are ordered; the first starts at 0, each later one starts where the
     previous ended.
   speedup_factor — playback speed multiplier (e.g. 1.25, 4.0, 5.0)
+  mute — optional bool (default False); if True, that segment’s audio is silent after processing.
 
 Video: after trim, setpts=PTS/speedup_factor (same idea as your example).
 Audio: atempo chain so the product equals speedup_factor (each atempo in (0.5, 2.0]).
@@ -71,15 +72,16 @@ def atempo_chain(factor: float) -> list[float]:
 
 def normalize_segments(
     raw: list[dict[str, Any]], duration: float
-) -> list[tuple[float, float, float]]:
-    """Return list of (start, end, speed). Starts at 0; each segment ends at end_time."""
-    out: list[tuple[float, float, float]] = []
+) -> list[tuple[float, float, float, bool]]:
+    """Return list of (start, end, speed, mute). Starts at 0; each segment ends at end_time."""
+    out: list[tuple[float, float, float, bool]] = []
     cursor = 0.0
     for i, seg in enumerate(raw):
         try:
             speed = float(seg["speedup_factor"])
         except KeyError as e:
             raise KeyError(f"segment {i}: missing required key {e}") from e
+        mute = bool(seg.get("mute", False))
         end_val = seg.get("end_time", None)
         if end_val is None:
             end = duration
@@ -94,13 +96,13 @@ def normalize_segments(
         end = max(start, min(end, duration))
         if end <= start:
             continue
-        out.append((start, end, speed))
+        out.append((start, end, speed, mute))
         cursor = end
     return out
 
 
 def build_filter_complex(
-    segments: list[tuple[float, float, float]], n: int
+    segments: list[tuple[float, float, float, bool]], n: int
 ) -> str:
     """Build the filter_complex string for n segments (after dropping empty ranges)."""
     if n < 1:
@@ -118,7 +120,7 @@ def build_filter_complex(
     parts.append(split_v)
     parts.append(split_a)
 
-    for (start, end, speed), vin, ain, vout, aout in zip(
+    for (start, end, speed, mute), vin, ain, vout, aout in zip(
         segments, v_labels, a_labels, v_out, a_out
     ):
         # Video: trim → reset PTS → apply speed (setpts = PTS / speed)
@@ -127,9 +129,15 @@ def build_filter_complex(
         )
         tempos = atempo_chain(speed)
         atempo_str = ",".join(f"atempo={t:g}" for t in tempos)
-        a_chain = (
-            f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str}[{aout}]"
-        )
+        if mute:
+            a_chain = (
+                f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str},"
+                f"volume=0[{aout}]"
+            )
+        else:
+            a_chain = (
+                f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str}[{aout}]"
+            )
         parts.append(v_chain)
         parts.append(a_chain)
 
@@ -144,7 +152,7 @@ def build_filter_complex(
 def build_ffmpeg_command(
     input_path: Path,
     output_path: Path,
-    segments: list[tuple[float, float, float]],
+    segments: list[tuple[float, float, float, bool]],
     *,
     extra_ffmpeg_args: list[str] | None = None,
 ) -> str:
