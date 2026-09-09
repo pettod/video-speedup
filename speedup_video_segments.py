@@ -5,6 +5,7 @@ the full ffmpeg command (or optionally run it).
 
 Input/output paths and segments default to ``INPUT_VIDEO``, ``OUTPUT_VIDEO``,
 ``SEGMENTS``, and ``AUDIO_VOLUME`` (final mix gain) in ``config.py``.
+``.mov`` inputs are accepted and written as ``.mp4`` (H.264 / AAC).
 
 Each segment dict uses:
   end_time — seconds (float) where this segment ends on the source timeline; use
@@ -183,6 +184,28 @@ def build_filter_complex(
     return ";".join(parts), None
 
 
+def resolve_output_path(input_path: Path, output_path: Path) -> Path:
+    """
+    Ensure .mov (and other QuickTime-style) inputs write an .mp4 container.
+    If the configured output still ends in .mov, replace the suffix with .mp4.
+    """
+    in_suffix = input_path.suffix.lower()
+    out_suffix = output_path.suffix.lower()
+    if in_suffix == ".mov" and out_suffix != ".mp4":
+        return output_path.with_suffix(".mp4")
+    if out_suffix == ".mov":
+        return output_path.with_suffix(".mp4")
+    return output_path
+
+
+def mp4_encode_args(*, has_audio: bool) -> list[str]:
+    """Codec flags for writing a broadly compatible MP4."""
+    args = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    if has_audio:
+        args.extend(["-c:a", "aac"])
+    return args
+
+
 def build_ffmpeg_argv(
     input_path: Path,
     output_path: Path,
@@ -192,11 +215,15 @@ def build_ffmpeg_argv(
     audio_volume: float = 1.0,
     extra_ffmpeg_args: list[str] | None = None,
 ) -> list[str]:
+    output_path = resolve_output_path(input_path, output_path)
     n = len(segments)
     fc, a_label = build_filter_complex(
         segments, n, has_audio=has_audio, audio_volume=audio_volume
     )
-    extra = extra_ffmpeg_args or []
+    extra = list(extra_ffmpeg_args or [])
+    if output_path.suffix.lower() == ".mp4":
+        # Prefer explicit MP4 codecs (important when converting from .mov).
+        extra = mp4_encode_args(has_audio=has_audio and a_label is not None) + extra
     argv = [
         "ffmpeg",
         "-y",
@@ -322,9 +349,16 @@ def main() -> int:
         print("Error: no valid segments after normalization.", file=sys.stderr)
         return 1
 
+    output_path = resolve_output_path(args.input, args.output)
+    if output_path != args.output:
+        print(
+            f"Note: writing MP4 instead of {args.output.name} → {output_path.name}",
+            file=sys.stderr,
+        )
+
     argv = build_ffmpeg_argv(
         args.input,
-        args.output,
+        output_path,
         segs,
         has_audio=has_audio,
         audio_volume=AUDIO_VOLUME,
