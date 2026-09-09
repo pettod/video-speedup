@@ -51,6 +51,28 @@ def ffprobe_duration_seconds(path: Path) -> float:
     return float(r.stdout.strip())
 
 
+def ffprobe_has_audio(path: Path) -> bool:
+    """Return True if the file has at least one audio stream."""
+    r = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return bool(r.stdout.strip())
+
+
 def atempo_chain(factor: float) -> list[float]:
     """
     Decompose speedup into ffmpeg atempo factors, each in (0.5, 2.0].
@@ -105,70 +127,77 @@ def build_filter_complex(
     segments: list[tuple[float, float, float, bool]],
     n: int,
     *,
+    has_audio: bool = True,
     audio_volume: float = 1.0,
-) -> tuple[str, str]:
-    """Build filter_complex and the final audio pad label to map (after concat, optional volume)."""
+) -> tuple[str, str | None]:
+    """
+    Build filter_complex and the final audio pad label to map (or None if video-only).
+    """
     if n < 1:
         raise ValueError("Need at least one non-empty segment.")
 
     v_labels = [f"v{i+1}" for i in range(n)]
-    a_labels = [f"a{i+1}" for i in range(n)]
     v_out = [f"v{i+1}out" for i in range(n)]
-    a_out = [f"a{i+1}out" for i in range(n)]
 
     parts: list[str] = []
+    parts.append(f"[0:v]split={n}" + "".join(f"[{lbl}]" for lbl in v_labels))
 
-    split_v = f"[0:v]split={n}" + "".join(f"[{lbl}]" for lbl in v_labels)
-    split_a = f"[0:a]asplit={n}" + "".join(f"[{lbl}]" for lbl in a_labels)
-    parts.append(split_v)
-    parts.append(split_a)
+    if has_audio:
+        a_labels = [f"a{i+1}" for i in range(n)]
+        a_out = [f"a{i+1}out" for i in range(n)]
+        parts.append(f"[0:a]asplit={n}" + "".join(f"[{lbl}]" for lbl in a_labels))
 
-    for (start, end, speed, mute), vin, ain, vout, aout in zip(
-        segments, v_labels, a_labels, v_out, a_out
-    ):
-        # Video: trim → reset PTS → apply speed (setpts = PTS / speed)
-        v_chain = (
+        for (start, end, speed, mute), vin, ain, vout, aout in zip(
+            segments, v_labels, a_labels, v_out, a_out
+        ):
+            parts.append(
+                f"[{vin}]trim={start}:{end},setpts=PTS-STARTPTS,setpts=PTS/{speed}[{vout}]"
+            )
+            tempos = atempo_chain(speed)
+            atempo_str = ",".join(f"atempo={t:g}" for t in tempos)
+            if mute:
+                parts.append(
+                    f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str},"
+                    f"volume=0[{aout}]"
+                )
+            else:
+                parts.append(
+                    f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str}[{aout}]"
+                )
+
+        concat_inputs = "".join(f"[{vo}][{ao}]" for vo, ao in zip(v_out, a_out))
+        parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]")
+
+        audio_label: str | None = "outa"
+        if abs(float(audio_volume) - 1.0) > 1e-9:
+            parts.append(f"[outa]volume={float(audio_volume):g}[outa_vol]")
+            audio_label = "outa_vol"
+        return ";".join(parts), audio_label
+
+    for (start, end, speed, _mute), vin, vout in zip(segments, v_labels, v_out):
+        parts.append(
             f"[{vin}]trim={start}:{end},setpts=PTS-STARTPTS,setpts=PTS/{speed}[{vout}]"
         )
-        tempos = atempo_chain(speed)
-        atempo_str = ",".join(f"atempo={t:g}" for t in tempos)
-        if mute:
-            a_chain = (
-                f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str},"
-                f"volume=0[{aout}]"
-            )
-        else:
-            a_chain = (
-                f"[{ain}]atrim={start}:{end},asetpts=PTS-STARTPTS,{atempo_str}[{aout}]"
-            )
-        parts.append(v_chain)
-        parts.append(a_chain)
-
-    concat_inputs = "".join(f"[{vo}][{ao}]" for vo, ao in zip(v_out, a_out))
-    parts.append(
-        f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa]"
-    )
-
-    audio_label = "outa"
-    if abs(float(audio_volume) - 1.0) > 1e-9:
-        parts.append(f"[outa]volume={float(audio_volume):g}[outa_vol]")
-        audio_label = "outa_vol"
-
-    return ";".join(parts), audio_label
+    concat_inputs = "".join(f"[{vo}]" for vo in v_out)
+    parts.append(f"{concat_inputs}concat=n={n}:v=1:a=0[outv]")
+    return ";".join(parts), None
 
 
-def build_ffmpeg_command(
+def build_ffmpeg_argv(
     input_path: Path,
     output_path: Path,
     segments: list[tuple[float, float, float, bool]],
     *,
+    has_audio: bool = True,
     audio_volume: float = 1.0,
     extra_ffmpeg_args: list[str] | None = None,
-) -> str:
+) -> list[str]:
     n = len(segments)
-    fc, a_label = build_filter_complex(segments, n, audio_volume=audio_volume)
+    fc, a_label = build_filter_complex(
+        segments, n, has_audio=has_audio, audio_volume=audio_volume
+    )
     extra = extra_ffmpeg_args or []
-    cmd_parts = [
+    argv = [
         "ffmpeg",
         "-y",
         "-i",
@@ -177,12 +206,31 @@ def build_ffmpeg_command(
         fc,
         "-map",
         "[outv]",
-        "-map",
-        f"[{a_label}]",
-        *extra,
-        str(output_path),
     ]
-    return " ".join(shlex.quote(p) for p in cmd_parts)
+    if a_label is not None:
+        argv.extend(["-map", f"[{a_label}]"])
+    argv.extend([*extra, str(output_path)])
+    return argv
+
+
+def build_ffmpeg_command(
+    input_path: Path,
+    output_path: Path,
+    segments: list[tuple[float, float, float, bool]],
+    *,
+    has_audio: bool = True,
+    audio_volume: float = 1.0,
+    extra_ffmpeg_args: list[str] | None = None,
+) -> str:
+    argv = build_ffmpeg_argv(
+        input_path,
+        output_path,
+        segments,
+        has_audio=has_audio,
+        audio_volume=audio_volume,
+        extra_ffmpeg_args=extra_ffmpeg_args,
+    )
+    return " ".join(shlex.quote(p) for p in argv)
 
 
 def parse_segments_json(s: str) -> list[dict[str, Any]]:
@@ -246,10 +294,15 @@ def main() -> int:
 
     probe_path = args.probe_input or args.input
     duration: float
-    if args.duration is not None:
+    has_audio = True
+    if probe_path.is_file():
+        has_audio = ffprobe_has_audio(probe_path)
+        if args.duration is not None:
+            duration = args.duration
+        else:
+            duration = ffprobe_duration_seconds(probe_path)
+    elif args.duration is not None:
         duration = args.duration
-    elif probe_path.is_file():
-        duration = ffprobe_duration_seconds(probe_path)
     else:
         print(
             "Error: need --duration, or an existing file at --input / --probe-input "
@@ -258,33 +311,27 @@ def main() -> int:
         )
         return 1
 
+    if not has_audio:
+        print(
+            "Note: input has no audio stream; building a video-only filter graph.",
+            file=sys.stderr,
+        )
+
     segs = normalize_segments(raw_segments, duration)
     if not segs:
         print("Error: no valid segments after normalization.", file=sys.stderr)
         return 1
 
-    cmd_str = build_ffmpeg_command(
-        args.input, args.output, segs, audio_volume=AUDIO_VOLUME
+    argv = build_ffmpeg_argv(
+        args.input,
+        args.output,
+        segs,
+        has_audio=has_audio,
+        audio_volume=AUDIO_VOLUME,
     )
-    print(cmd_str)
+    print(" ".join(shlex.quote(p) for p in argv))
 
     if args.run:
-        # Rebuild argv without shell — execute directly
-        n = len(segs)
-        fc, a_label = build_filter_complex(segs, n, audio_volume=AUDIO_VOLUME)
-        argv = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(args.input),
-            "-filter_complex",
-            fc,
-            "-map",
-            "[outv]",
-            "-map",
-            f"[{a_label}]",
-            str(args.output),
-        ]
         print("--- running ---", file=sys.stderr)
         r = subprocess.run(argv)
         return r.returncode

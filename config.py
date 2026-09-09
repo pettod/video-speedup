@@ -1,8 +1,8 @@
 from __future__ import annotations
 from typing import Any
 
-INPUT_VIDEO = "input.mp4"
-OUTPUT_VIDEO = f"speedup_{INPUT_VIDEO}"
+INPUT_VIDEO = "video.mp4"
+OUTPUT_VIDEO = f"{INPUT_VIDEO.split('.')[0]}_processed.mp4"
 
 AUDIO_VOLUME = 1.0
 SEGMENTS: list[dict[str, Any]] = [
